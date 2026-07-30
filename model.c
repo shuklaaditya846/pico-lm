@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 // ---- PSRAM bulk float helpers -------------------------------------------
 
@@ -15,20 +16,61 @@ static inline void kv_write(psram_spi_inst_t* spi, uint32_t addr, const float* v
     const uint8_t* src = (const uint8_t*)v;
     size_t remaining = (size_t)n * sizeof(float);
     uint32_t a = addr;
+    uint8_t verify[PSRAM_MAX_CHUNK];
     while (remaining > 0) {
         size_t chunk = remaining < PSRAM_MAX_CHUNK ? remaining : PSRAM_MAX_CHUNK;
-        psram_write(spi, a, src, chunk);
+        for (int attempt = 0; attempt < 5; attempt++) {
+            psram_write(spi, a, src, chunk);
+            psram_read(spi, a, verify, chunk);
+            if (memcmp(verify, src, chunk) == 0) break;
+#ifdef PSRAM_DEBUG
+            printf("PSRAM write mismatch at addr %lu, attempt %d\n", (unsigned long)a, attempt);
+#endif
+        }
         src += chunk; a += chunk; remaining -= chunk;
     }
 }
 static inline void kv_read(psram_spi_inst_t* spi, uint32_t addr, float* v, int n) {
-    uint8_t* dst = (uint8_t*)v;
-    size_t remaining = (size_t)n * sizeof(float);
-    uint32_t a = addr;
-    while (remaining > 0) {
-        size_t chunk = remaining < PSRAM_MAX_CHUNK ? remaining : PSRAM_MAX_CHUNK;
-        psram_read(spi, a, dst, chunk);
-        dst += chunk; a += chunk; remaining -= chunk;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        uint8_t* dst = (uint8_t*)v;
+        size_t remaining = (size_t)n * sizeof(float);
+        uint32_t a = addr;
+        while (remaining > 0) {
+            size_t chunk = remaining < PSRAM_MAX_CHUNK ? remaining : PSRAM_MAX_CHUNK;
+            psram_read(spi, a, dst, chunk);
+            dst += chunk; a += chunk; remaining -= chunk;
+        }
+        // Sanity check: reject NaN/Inf or implausible magnitudes and retry the
+        // read. Real activations in this model stay well under this range;
+        // anything wildly outside it means the SPI transfer glitched.
+        int ok = 1;
+        for (int i = 0; i < n; i++) {
+            float val = v[i];
+            if (!(val == val) || val > 1e4f || val < -1e4f) { ok = 0; break; }
+        }
+        if (ok) return;
+#ifdef PSRAM_DEBUG
+        printf("kv_read: implausible data at addr %lu, retrying (attempt %d)\n", (unsigned long)addr, attempt);
+#endif
+    }
+    // Every attempt looked bad - zero it out rather than let garbage/NaN
+    // cascade through the rest of generation forever.
+    memset(v, 0, (size_t)n * sizeof(float));
+}
+
+// One-shot diagnostic: tells us exactly where a NaN/Inf first appears so we
+// know whether the write-verify above actually fixed the root cause, or
+// whether something else is overflowing.
+static int nan_already_reported = 0;
+static void check_finite(const char* where, const float* buf, int n, int layer, int pos) {
+    if (nan_already_reported) return;
+    for (int i = 0; i < n; i++) {
+        if (!(buf[i] == buf[i]) || buf[i] > 1e30f || buf[i] < -1e30f) { // NaN or blown-up value
+            printf("[DIAG] non-finite value at %s, layer=%d pos=%d index=%d value=%f\n",
+                   where, layer, pos, i, (double)buf[i]);
+            nan_already_reported = 1;
+            return;
+        }
     }
 }
 
@@ -137,6 +179,8 @@ float* transformer_forward(Transformer* t, psram_spi_inst_t* psram, int token, i
         float* v_local = s->valt;
         matmul(k_local, s->xb, w->wk + (size_t)l * dim * kv_dim, dim, kv_dim);
         matmul(v_local, s->xb, w->wv + (size_t)l * dim * kv_dim, dim, kv_dim);
+        check_finite("k_local", k_local, kv_dim, l, pos);
+        check_finite("v_local", v_local, kv_dim, l, pos);
 
         // RoPE, computed on the fly (matches modern llama2.c export format)
         for (int i = 0; i < dim; i += 2) {
@@ -190,6 +234,7 @@ float* transformer_forward(Transformer* t, psram_spi_inst_t* psram, int token, i
 
         matmul(s->xb2, s->xb, w->wo + (size_t)l * dim * dim, dim, dim);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
+        check_finite("x_after_attn", s->x, dim, l, pos);
 
         // FFN (SwiGLU)
         rmsnorm(s->xb, s->x, w->rms_ffn_weight + (size_t)l * dim, dim);
@@ -202,9 +247,11 @@ float* transformer_forward(Transformer* t, psram_spi_inst_t* psram, int token, i
         }
         matmul(s->xb, s->hb, w->w2 + (size_t)l * hidden_dim * dim, hidden_dim, dim);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
+        check_finite("x_after_ffn", s->x, dim, l, pos);
     }
 
     rmsnorm(s->x, s->x, w->rms_final_weight, dim);
     matmul(s->logits, s->x, w->wcls, dim, p->vocab_size);
+    check_finite("logits", s->logits, p->vocab_size, p->n_layers, pos);
     return s->logits;
 }

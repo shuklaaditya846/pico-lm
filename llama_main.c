@@ -14,8 +14,10 @@ extern const uint8_t _binary_stories260K_bin_start[];
 extern const uint8_t _binary_tok512_bin_start[];
 
 #define PROMPT ""          // empty = model free-runs from BOS, like the CLI with no prompt
-#define TEMPERATURE 0.6f   // 0.0f = greedy/deterministic, matches `run`'s default of 1.0 otherwise
-#define MAX_TOKENS 256      // cap generation length (<= seq_len from the model header)
+#define TEMPERATURE 1.0f   // matches `run`'s default
+#define TOP_P 0.9f         // matches `run`'s default nucleus sampling cutoff
+// #define MAX_TOKENS 256      // cap generation length (<= seq_len from the model header)
+#define MAX_TOKENS 1024      // pushing is more than moedel header sequence length (seq_len=512)
 
 int main() {
     stdio_init_all();
@@ -35,6 +37,8 @@ int main() {
     Tokenizer tok;
     tokenizer_init(&tok, _binary_tok512_bin_start, p->vocab_size);
 
+    ProbIndex* probindex = malloc((size_t)p->vocab_size * sizeof(ProbIndex));
+
     int prompt_tokens[128];
     int n_prompt = tokenizer_encode(&tok, PROMPT, prompt_tokens, 128);
 
@@ -45,7 +49,7 @@ int main() {
 
     int token = prompt_tokens[0]; // BOS
     int pos = 0;
-    char piece_buf[4];
+    char piece_buf[64]; // comfortably covers any realistic BPE merged-token length
     int plen;
 
     while (pos < steps) {
@@ -55,10 +59,10 @@ int main() {
         if (pos < n_prompt - 1) {
             next = prompt_tokens[pos + 1]; // still feeding the prompt
         } else {
-            next = sample_temperature(logits, p->vocab_size, TEMPERATURE);
+            next = sample(logits, p->vocab_size, TEMPERATURE, TOP_P, probindex);
         }
 
-        tokenizer_decode_piece(&tok, token, next, piece_buf, &plen);
+        tokenizer_decode_piece(&tok, token, next, piece_buf, sizeof(piece_buf), &plen);
         fwrite(piece_buf, 1, plen, stdout);
         fflush(stdout);
 

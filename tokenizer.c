@@ -71,20 +71,21 @@ int tokenizer_encode(Tokenizer* t, const char* text, int* tokens, int max_tokens
     return n;
 }
 
-void tokenizer_decode_piece(Tokenizer* t, int prev_token, int token, char* out, int* out_len) {
+void tokenizer_decode_piece(Tokenizer* t, int prev_token, int token, char* out, size_t out_capacity, int* out_len) {
     const char* piece = t->vocab_str[token];
     int len = t->vocab_len[token];
 
     if (prev_token == 1 && len > 0 && piece[0] == ' ') { piece++; len--; } // strip sentencepiece dummy space after BOS
 
     // raw byte token looks like "<0xAB>" (len == 6)
-    if (len == 6 && piece[0] == '<' && piece[1] == '0' && piece[2] == 'x') {
+    if (len == 6 && piece[0] == '<' && piece[1] == '0' && piece[2] == 'x' && out_capacity >= 1) {
         char hex[3] = { piece[3], piece[4], 0 };
         out[0] = (char)strtol(hex, NULL, 16);
         *out_len = 1;
         return;
     }
 
+    if ((size_t)len > out_capacity) len = (int)out_capacity; // never overflow the caller's buffer
     memcpy(out, piece, len);
     *out_len = len;
 }
@@ -104,15 +105,50 @@ static float randf(void) {
     return (rng_state >> 8) / 16777216.0f;
 }
 
-int sample_temperature(float* logits, int n, float temperature) {
+static int compare_probindex_desc(const void* a, const void* b) {
+    float pa = ((const ProbIndex*)a)->prob;
+    float pb = ((const ProbIndex*)b)->prob;
+    if (pa > pb) return -1;
+    if (pa < pb) return 1;
+    return 0;
+}
+
+int sample(float* logits, int n, float temperature, float topp, ProbIndex* probindex) {
     if (temperature <= 0.0f) return sample_argmax(logits, n);
+
     for (int i = 0; i < n; i++) logits[i] /= temperature;
     float maxv = logits[0];
     for (int i = 1; i < n; i++) if (logits[i] > maxv) maxv = logits[i];
     float sum = 0.0f;
     for (int i = 0; i < n; i++) { logits[i] = expf(logits[i] - maxv); sum += logits[i]; }
     for (int i = 0; i < n; i++) logits[i] /= sum;
-    float r = randf(), cdf = 0.0f;
-    for (int i = 0; i < n; i++) { cdf += logits[i]; if (r < cdf) return i; }
-    return n - 1;
+
+    if (topp <= 0.0f || topp >= 1.0f) {
+        // full-distribution multinomial sampling, no truncation
+        float r = randf(), cdf = 0.0f;
+        for (int i = 0; i < n; i++) { cdf += logits[i]; if (r < cdf) return i; }
+        return n - 1;
+    }
+
+    // top-p (nucleus): sort by probability, keep the smallest prefix whose
+    // cumulative mass exceeds topp, renormalize, sample from that prefix only.
+    // This is what strips off the long low-probability tail that otherwise
+    // causes a weak model to collapse onto a single filler token.
+    for (int i = 0; i < n; i++) { probindex[i].index = i; probindex[i].prob = logits[i]; }
+    qsort(probindex, n, sizeof(ProbIndex), compare_probindex_desc);
+
+    float cumulative = 0.0f;
+    int last_idx = n - 1;
+    for (int i = 0; i < n; i++) {
+        cumulative += probindex[i].prob;
+        if (cumulative > topp) { last_idx = i; break; }
+    }
+
+    float r = randf() * cumulative;
+    float cdf = 0.0f;
+    for (int i = 0; i <= last_idx; i++) {
+        cdf += probindex[i].prob;
+        if (r < cdf) return probindex[i].index;
+    }
+    return probindex[last_idx].index;
 }

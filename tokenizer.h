@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct {
     int vocab_size;
@@ -16,8 +17,16 @@ void tokenizer_init(Tokenizer* t, const uint8_t* tok_blob, int vocab_size);
 int tokenizer_encode(Tokenizer* t, const char* text, int* tokens, int max_tokens);
 
 // Decodes token (given previous token, for BOS-leading-space handling) into out.
-// out must be at least 4 bytes. Writes *out_len bytes (no null terminator).
-void tokenizer_decode_piece(Tokenizer* t, int prev_token, int token, char* out, int* out_len);
+// out_capacity is the size of out; the piece is truncated (never overflowed) to fit.
+// Writes *out_len bytes (no null terminator).
+void tokenizer_decode_piece(Tokenizer* t, int prev_token, int token, char* out, size_t out_capacity, int* out_len);
 
 int sample_argmax(const float* logits, int n);
-int sample_temperature(float* logits, int n, float temperature);
+
+// probindex_scratch must point at an array of n ProbIndex entries (caller-owned,
+// allocate once with vocab_size entries and reuse across calls).
+typedef struct { float prob; int index; } ProbIndex;
+
+// Full reference sampling: temperature scaling + softmax + top-p (nucleus) truncation.
+// temperature <= 0 -> greedy argmax. topp <= 0 or >= 1 -> full-distribution sampling (no truncation).
+int sample(float* logits, int n, float temperature, float topp, ProbIndex* probindex_scratch);
