@@ -14,7 +14,7 @@ extern const uint8_t _binary_stories260K_bin_start[];
 extern const uint8_t _binary_tok512_bin_start[];
 
 #define PROMPT ""          // empty = model free-runs from BOS, like the CLI with no prompt
-#define TEMPERATURE 1.0f   // 0.0f = greedy/deterministic, matches `run`'s default of 1.0 otherwise
+#define TEMPERATURE 0.6f   // 0.0f = greedy/deterministic, matches `run`'s default of 1.0 otherwise
 #define MAX_TOKENS 256      // cap generation length (<= seq_len from the model header)
 
 int main() {

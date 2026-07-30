@@ -5,11 +5,31 @@
 
 // ---- PSRAM bulk float helpers -------------------------------------------
 
+// The PIO SPI program packs the transaction bit-count into a single uint8_t
+// (write_command[0] = (4 + count) * 8 in psram_spi.h), which overflows past
+// ~27-31 bytes. Larger single calls silently corrupt the PIO transaction and
+// hang dma_channel_wait_for_finish_blocking() forever. Chunk everything.
+#define PSRAM_MAX_CHUNK 16u
+
 static inline void kv_write(psram_spi_inst_t* spi, uint32_t addr, const float* v, int n) {
-    psram_write(spi, addr, (const uint8_t*)v, (size_t)n * sizeof(float));
+    const uint8_t* src = (const uint8_t*)v;
+    size_t remaining = (size_t)n * sizeof(float);
+    uint32_t a = addr;
+    while (remaining > 0) {
+        size_t chunk = remaining < PSRAM_MAX_CHUNK ? remaining : PSRAM_MAX_CHUNK;
+        psram_write(spi, a, src, chunk);
+        src += chunk; a += chunk; remaining -= chunk;
+    }
 }
 static inline void kv_read(psram_spi_inst_t* spi, uint32_t addr, float* v, int n) {
-    psram_read(spi, addr, (uint8_t*)v, (size_t)n * sizeof(float));
+    uint8_t* dst = (uint8_t*)v;
+    size_t remaining = (size_t)n * sizeof(float);
+    uint32_t a = addr;
+    while (remaining > 0) {
+        size_t chunk = remaining < PSRAM_MAX_CHUNK ? remaining : PSRAM_MAX_CHUNK;
+        psram_read(spi, a, dst, chunk);
+        dst += chunk; a += chunk; remaining -= chunk;
+    }
 }
 
 // ---- math primitives ------------------------------------------------------
