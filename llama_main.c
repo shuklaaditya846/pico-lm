@@ -16,8 +16,8 @@ extern const uint8_t _binary_tok512_bin_start[];
 #define PROMPT ""          // empty = model free-runs from BOS, like the CLI with no prompt
 #define TEMPERATURE 1.0f   // matches `run`'s default
 #define TOP_P 0.9f         // matches `run`'s default nucleus sampling cutoff
-// #define MAX_TOKENS 256      // cap generation length (<= seq_len from the model header)
-#define MAX_TOKENS 1024      // pushing is more than moedel header sequence length (seq_len=512)
+#define MAX_TOKENS 256      // cap generation length (<= seq_len from the model header)
+// #define MAX_TOKENS 1024      // pushing is more than moedel header sequence length (seq_len=512)
 
 int main() {
     stdio_init_all();

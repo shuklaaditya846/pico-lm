@@ -101,43 +101,158 @@ static void matmul(float* out, const float* x, const float* w, int n, int d) {
     }
 }
 
+// Same as matmul(), but weights are int8 with one fp32 scale per group_size
+// contiguous elements (v2 quantized format). Dequantizes on the fly and
+// multiplies against the (still fp32) activation vector - simpler and just
+// as correct as int8xint8 dot products, at some cost in raw speed.
+static void matmul_q8(float* out, const float* x, const int8_t* q, const float* scale,
+                       int n, int d, int group_size) {
+    for (int i = 0; i < d; i++) {
+        int64_t row_start = (int64_t)i * n;
+        float sum = 0.0f;
+        for (int j = 0; j < n; j++) {
+            int64_t k = row_start + j;
+            sum += (q[k] * scale[k / group_size]) * x[j];
+        }
+        out[i] = sum;
+    }
+}
+
+// Dispatches to matmul() or matmul_q8() depending on whether q is non-NULL.
+// Lets forward() call one thing at each weight site regardless of format.
+static void linear(float* out, const float* x, const float* w_fp32,
+                    const int8_t* w_q, const float* w_scale, int group_size, int n, int d) {
+    if (w_q) {
+        matmul_q8(out, x, w_q, w_scale, n, d, group_size);
+    } else {
+        matmul(out, x, w_fp32, n, d);
+    }
+}
+
+// Dequantizes `n` consecutive elements starting at flat offset `row*n` from a
+// quantized tensor - used for the embedding lookup (one row, not a full matmul).
+static void dequant_row(float* out, const int8_t* q, const float* scale, int64_t row, int n, int group_size) {
+    int64_t base = row * n;
+    for (int j = 0; j < n; j++) {
+        int64_t k = base + j;
+        out[j] = q[k] * scale[k / group_size];
+    }
+}
+
 // ---- init -------------------------------------------------------------
 
+#define AK42_MAGIC 0x616b3432u
+
+// Advances *ptr past one quantized tensor (numel int8 values + numel/group_size
+// fp32 scales) and returns pointers to its start, matching version2_export's
+// serialize_int8() then serialize_fp32(scale) order exactly.
+static void take_quantized(const uint8_t** ptr, int64_t numel, int group_size,
+                            const int8_t** out_q, const float** out_s) {
+    *out_q = (const int8_t*)(*ptr);
+    *ptr += numel;
+    *out_s = (const float*)(*ptr);
+    *ptr += (numel / group_size) * (int64_t)sizeof(float);
+}
+
 void transformer_init(Transformer* t, const uint8_t* blob) {
-    int32_t h[7];
-    memcpy(h, blob, sizeof(h)); // header is always 4-byte aligned by construction
-
     Config* p = &t->config;
-    p->dim = h[0];
-    p->hidden_dim = h[1];
-    p->n_layers = h[2];
-    p->n_heads = h[3];
-    p->n_kv_heads = h[4];
-    int vocab_raw = h[5];
-    p->seq_len = h[6];
-    int shared_weights = vocab_raw > 0;
-    p->vocab_size = shared_weights ? vocab_raw : -vocab_raw;
-
-    int head_size = p->dim / p->n_heads;
-    const float* ptr = (const float*)(blob + sizeof(h));
-
     TransformerWeights* w = &t->weights;
-    w->token_embedding_table = ptr; ptr += (size_t)p->vocab_size * p->dim;
-    w->rms_att_weight = ptr;        ptr += (size_t)p->n_layers * p->dim;
-    w->wq = ptr;                    ptr += (size_t)p->n_layers * p->dim * (p->n_heads * head_size);
-    w->wk = ptr;                    ptr += (size_t)p->n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wv = ptr;                    ptr += (size_t)p->n_layers * p->dim * (p->n_kv_heads * head_size);
-    w->wo = ptr;                    ptr += (size_t)p->n_layers * (p->n_heads * head_size) * p->dim;
-    w->rms_ffn_weight = ptr;        ptr += (size_t)p->n_layers * p->dim;
-    w->w1 = ptr;                    ptr += (size_t)p->n_layers * p->dim * p->hidden_dim;
-    w->w2 = ptr;                    ptr += (size_t)p->n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;                    ptr += (size_t)p->n_layers * p->dim * p->hidden_dim;
-    w->rms_final_weight = ptr;      ptr += p->dim;
-    ptr += (size_t)p->seq_len * head_size / 2; // legacy freq_cis_real placeholder (unused, RoPE computed on the fly)
-    ptr += (size_t)p->seq_len * head_size / 2; // legacy freq_cis_imag placeholder
-    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+    memset(w, 0, sizeof(*w)); // ensures the unused pointer set (fp32 or quantized) is NULL
 
+    uint32_t magic;
+    memcpy(&magic, blob, 4);
+
+    const uint8_t* body;
+
+    if (magic == AK42_MAGIC) {
+        int32_t version;
+        memcpy(&version, blob + 4, 4);
+        int32_t hdr[7];
+        memcpy(hdr, blob + 8, sizeof(hdr));
+        p->dim = hdr[0]; p->hidden_dim = hdr[1]; p->n_layers = hdr[2]; p->n_heads = hdr[3];
+        p->n_kv_heads = hdr[4]; p->vocab_size = hdr[5]; p->seq_len = hdr[6];
+        uint8_t shared_classifier_byte;
+        memcpy(&shared_classifier_byte, blob + 36, 1);
+        p->shared_classifier = shared_classifier_byte;
+        p->quantized = (version == 2);
+        p->group_size = 0;
+        if (version == 2) memcpy(&p->group_size, blob + 37, 4);
+        body = blob + 256; // v1/v2 header is always padded to exactly 256 bytes
+    } else {
+        // legacy v0: no magic, header is just the 7 ints at offset 0, and
+        // vocab_size's sign doubles as the shared-classifier flag
+        int32_t hdr[7];
+        memcpy(hdr, blob, sizeof(hdr));
+        p->dim = hdr[0]; p->hidden_dim = hdr[1]; p->n_layers = hdr[2]; p->n_heads = hdr[3];
+        p->n_kv_heads = hdr[4];
+        int32_t vocab_raw = hdr[5];
+        p->seq_len = hdr[6];
+        p->shared_classifier = vocab_raw > 0;
+        p->vocab_size = p->shared_classifier ? vocab_raw : -vocab_raw;
+        p->quantized = 0;
+        p->group_size = 0;
+        body = blob + sizeof(hdr); // legacy header is exactly 28 bytes, no padding
+    }
+
+    int64_t dim = p->dim, hidden_dim = p->hidden_dim, n_layers = p->n_layers, vocab_size = p->vocab_size;
+    int head_size = p->dim / p->n_heads;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+
+    if (!p->quantized) {
+        const float* ptr = (const float*)body;
+        w->token_embedding_table = ptr; ptr += vocab_size * dim;
+        w->rms_att_weight = ptr;        ptr += n_layers * dim;
+        w->wq = ptr;                    ptr += n_layers * dim * (p->n_heads * head_size);
+        w->wk = ptr;                    ptr += n_layers * dim * kv_dim;
+        w->wv = ptr;                    ptr += n_layers * dim * kv_dim;
+        w->wo = ptr;                    ptr += n_layers * (p->n_heads * head_size) * dim;
+        w->rms_ffn_weight = ptr;        ptr += n_layers * dim;
+        w->w1 = ptr;                    ptr += n_layers * dim * hidden_dim;
+        w->w2 = ptr;                    ptr += n_layers * hidden_dim * dim;
+        w->w3 = ptr;                    ptr += n_layers * dim * hidden_dim;
+        w->rms_final_weight = ptr;      ptr += dim;
+        ptr += p->seq_len * head_size / 2; // legacy freq_cis_real placeholder (unused, RoPE computed on the fly)
+        ptr += p->seq_len * head_size / 2; // legacy freq_cis_imag placeholder
+        w->wcls = p->shared_classifier ? w->token_embedding_table : ptr;
+    } else {
+        // v2 quantized: fp32 norms first, then quantized tensors in the exact
+        // order version2_export() writes them.
+        const uint8_t* ptr = body;
+        w->rms_att_weight = (const float*)ptr;  ptr += n_layers * dim * sizeof(float);
+        w->rms_ffn_weight = (const float*)ptr;  ptr += n_layers * dim * sizeof(float);
+        w->rms_final_weight = (const float*)ptr; ptr += dim * sizeof(float);
+
+        int gs = p->group_size;
+        take_quantized(&ptr, vocab_size * dim, gs, &w->q_token_embedding_table, &w->s_token_embedding_table);
+
+        w->q_wq = malloc(n_layers * sizeof(int8_t*)); w->s_wq = malloc(n_layers * sizeof(float*));
+        for (int l = 0; l < n_layers; l++) take_quantized(&ptr, dim * dim, gs, &w->q_wq[l], &w->s_wq[l]);
+
+        w->q_wk = malloc(n_layers * sizeof(int8_t*)); w->s_wk = malloc(n_layers * sizeof(float*));
+        for (int l = 0; l < n_layers; l++) take_quantized(&ptr, dim * kv_dim, gs, &w->q_wk[l], &w->s_wk[l]);
+
+        w->q_wv = malloc(n_layers * sizeof(int8_t*)); w->s_wv = malloc(n_layers * sizeof(float*));
+        for (int l = 0; l < n_layers; l++) take_quantized(&ptr, dim * kv_dim, gs, &w->q_wv[l], &w->s_wv[l]);
+
+        w->q_wo = malloc(n_layers * sizeof(int8_t*)); w->s_wo = malloc(n_layers * sizeof(float*));
+        for (int l = 0; l < n_layers; l++) take_quantized(&ptr, dim * dim, gs, &w->q_wo[l], &w->s_wo[l]);
+
+        w->q_w1 = malloc(n_layers * sizeof(int8_t*)); w->s_w1 = malloc(n_layers * sizeof(float*));
+        for (int l = 0; l < n_layers; l++) take_quantized(&ptr, dim * hidden_dim, gs, &w->q_w1[l], &w->s_w1[l]);
+
+        w->q_w2 = malloc(n_layers * sizeof(int8_t*)); w->s_w2 = malloc(n_layers * sizeof(float*));
+        for (int l = 0; l < n_layers; l++) take_quantized(&ptr, hidden_dim * dim, gs, &w->q_w2[l], &w->s_w2[l]);
+
+        w->q_w3 = malloc(n_layers * sizeof(int8_t*)); w->s_w3 = malloc(n_layers * sizeof(float*));
+        for (int l = 0; l < n_layers; l++) take_quantized(&ptr, dim * hidden_dim, gs, &w->q_w3[l], &w->s_w3[l]);
+
+        if (!p->shared_classifier) {
+            take_quantized(&ptr, vocab_size * dim, gs, &w->q_wcls, &w->s_wcls);
+        } else {
+            w->q_wcls = w->q_token_embedding_table;
+            w->s_wcls = w->s_token_embedding_table;
+        }
+    }
 
     RunState* s = &t->state;
     s->x      = malloc((size_t)p->dim * sizeof(float));
@@ -168,17 +283,35 @@ float* transformer_forward(Transformer* t, psram_spi_inst_t* psram, int token, i
     int hidden_dim = p->hidden_dim;
     int head_size = dim / p->n_heads;
 
-    memcpy(s->x, w->token_embedding_table + (size_t)token * dim, dim * sizeof(float));
+    if (p->quantized) {
+        dequant_row(s->x, w->q_token_embedding_table, w->s_token_embedding_table, token, dim, p->group_size);
+    } else {
+        memcpy(s->x, w->token_embedding_table + (size_t)token * dim, dim * sizeof(float));
+    }
 
     for (int l = 0; l < p->n_layers; l++) {
         rmsnorm(s->xb, s->x, w->rms_att_weight + (size_t)l * dim, dim);
 
-        matmul(s->q, s->xb, w->wq + (size_t)l * dim * dim, dim, dim);
+        int gs = p->group_size;
+
+        linear(s->q, s->xb,
+               w->wq ? w->wq + (size_t)l * dim * dim : NULL,
+               w->q_wq ? w->q_wq[l] : NULL,
+               w->q_wq ? w->s_wq[l] : NULL,
+               gs, dim, dim);
         // k/v go straight into small local buffers before being written to PSRAM
         float* k_local = s->keyt;
         float* v_local = s->valt;
-        matmul(k_local, s->xb, w->wk + (size_t)l * dim * kv_dim, dim, kv_dim);
-        matmul(v_local, s->xb, w->wv + (size_t)l * dim * kv_dim, dim, kv_dim);
+        linear(k_local, s->xb,
+               w->wk ? w->wk + (size_t)l * dim * kv_dim : NULL,
+               w->q_wk ? w->q_wk[l] : NULL,
+               w->q_wk ? w->s_wk[l] : NULL,
+               gs, dim, kv_dim);
+        linear(v_local, s->xb,
+               w->wv ? w->wv + (size_t)l * dim * kv_dim : NULL,
+               w->q_wv ? w->q_wv[l] : NULL,
+               w->q_wv ? w->s_wv[l] : NULL,
+               gs, dim, kv_dim);
         check_finite("k_local", k_local, kv_dim, l, pos);
         check_finite("v_local", v_local, kv_dim, l, pos);
 
@@ -232,26 +365,41 @@ float* transformer_forward(Transformer* t, psram_spi_inst_t* psram, int token, i
             }
         }
 
-        matmul(s->xb2, s->xb, w->wo + (size_t)l * dim * dim, dim, dim);
+        linear(s->xb2, s->xb,
+               w->wo ? w->wo + (size_t)l * dim * dim : NULL,
+               w->q_wo ? w->q_wo[l] : NULL,
+               w->q_wo ? w->s_wo[l] : NULL,
+               gs, dim, dim);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
         check_finite("x_after_attn", s->x, dim, l, pos);
 
-        // FFN (SwiGLU)
         rmsnorm(s->xb, s->x, w->rms_ffn_weight + (size_t)l * dim, dim);
-        matmul(s->hb, s->xb, w->w1 + (size_t)l * dim * hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + (size_t)l * dim * hidden_dim, dim, hidden_dim);
+        linear(s->hb, s->xb,
+               w->w1 ? w->w1 + (size_t)l * dim * hidden_dim : NULL,
+               w->q_w1 ? w->q_w1[l] : NULL,
+               w->q_w1 ? w->s_w1[l] : NULL,
+               gs, dim, hidden_dim);
+        linear(s->hb2, s->xb,
+               w->w3 ? w->w3 + (size_t)l * dim * hidden_dim : NULL,
+               w->q_w3 ? w->q_w3[l] : NULL,
+               w->q_w3 ? w->s_w3[l] : NULL,
+               gs, dim, hidden_dim);
         for (int i = 0; i < hidden_dim; i++) {
             float v = s->hb[i];
             v *= (1.0f / (1.0f + expf(-v))); // SiLU
             s->hb[i] = v * s->hb2[i];
         }
-        matmul(s->xb, s->hb, w->w2 + (size_t)l * hidden_dim * dim, hidden_dim, dim);
+        linear(s->xb, s->hb,
+               w->w2 ? w->w2 + (size_t)l * hidden_dim * dim : NULL,
+               w->q_w2 ? w->q_w2[l] : NULL,
+               w->q_w2 ? w->s_w2[l] : NULL,
+               gs, hidden_dim, dim);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
         check_finite("x_after_ffn", s->x, dim, l, pos);
     }
 
     rmsnorm(s->x, s->x, w->rms_final_weight, dim);
-    matmul(s->logits, s->x, w->wcls, dim, p->vocab_size);
+    linear(s->logits, s->x, w->wcls, w->q_wcls, w->s_wcls, p->group_size, dim, p->vocab_size);
     check_finite("logits", s->logits, p->vocab_size, p->n_layers, pos);
     return s->logits;
 }
