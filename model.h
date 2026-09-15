@@ -67,8 +67,10 @@ typedef struct {
     float* valt;   // kv_dim  (scratch for one PSRAM read)
     float* att;    // n_heads * seq_len
     float* logits; // vocab_size
-    uint32_t key_cache_base;   // PSRAM byte offset, size = n_layers*seq_len*kv_dim*4
+    uint32_t kv_slot_bytes;    // bytes per cached vector, including trailing checksum
+    uint32_t key_cache_base;   // PSRAM byte offset, size = n_layers*seq_len*kv_slot_bytes
     uint32_t value_cache_base; // PSRAM byte offset, same size, placed right after
+    uint8_t* sram_kv;          // only used when built with -DKV_CACHE_IN_SRAM
 } RunState;
 
 typedef struct {
@@ -83,3 +85,7 @@ typedef struct {
 void transformer_init(Transformer* t, const uint8_t* model_blob);
 
 float* transformer_forward(Transformer* t, psram_spi_inst_t* psram, int token, int pos);
+
+// Prints KV-cache retry/failure counters. A non-zero HARD FAILURES count means
+// PSRAM returned corrupt data that survived every retry - i.e. real data loss.
+void kv_stats_print(void);

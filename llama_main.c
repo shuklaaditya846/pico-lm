@@ -1,5 +1,5 @@
 // llama2.c on Pico 2 W: weights read directly from flash (XIP), KV cache in PSRAM.
-// Equivalent of: ./run stories260K.bin -z tok512.bin
+// Interactive REPL over USB serial: type a prompt, press enter, watch it generate.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,11 +13,30 @@
 extern const uint8_t _binary_stories260K_bin_start[];
 extern const uint8_t _binary_tok512_bin_start[];
 
-#define PROMPT ""          // empty = model free-runs from BOS, like the CLI with no prompt
 #define TEMPERATURE 1.0f   // matches `run`'s default
 #define TOP_P 0.9f         // matches `run`'s default nucleus sampling cutoff
-#define MAX_TOKENS 256      // cap generation length (<= seq_len from the model header)
-// #define MAX_TOKENS 1024      // pushing is more than moedel header sequence length (seq_len=512)
+#define MAX_TOKENS 256     // cap generation length per prompt (<= seq_len from the model header)
+#define PROMPT_BUF_SIZE 128
+
+// Blocking line read from USB serial, with basic backspace/echo handling.
+static void read_line(char* buf, int size) {
+    int i = 0;
+    while (i < size - 1) {
+        int c = getchar();
+        if (c == '\r' || c == '\n') {
+            if (i == 0) continue; // swallow a stray leading CR/LF
+            break;
+        }
+        if (c == 8 || c == 127) { // backspace / DEL
+            if (i > 0) { i--; printf("\b \b"); fflush(stdout); }
+            continue;
+        }
+        putchar(c); fflush(stdout); // local echo, since most terminals won't do it for you
+        buf[i++] = (char)c;
+    }
+    buf[i] = '\0';
+    printf("\n");
+}
 
 int main() {
     stdio_init_all();
@@ -39,38 +58,48 @@ int main() {
 
     ProbIndex* probindex = malloc((size_t)p->vocab_size * sizeof(ProbIndex));
 
-    int prompt_tokens[128];
-    int n_prompt = tokenizer_encode(&tok, PROMPT, prompt_tokens, 128);
-
     int steps = MAX_TOKENS;
     if (steps > p->seq_len) steps = p->seq_len;
 
-    printf("\nGenerating (%d steps max):\n\n", steps);
+    char prompt[PROMPT_BUF_SIZE];
+    int prompt_tokens[PROMPT_BUF_SIZE];
+    char piece_buf[64];
 
-    int token = prompt_tokens[0]; // BOS
-    int pos = 0;
-    char piece_buf[64]; // comfortably covers any realistic BPE merged-token length
-    int plen;
+    printf("\nType a prompt and press enter. Ctrl+C / reset to stop.\n");
 
-    while (pos < steps) {
-        float* logits = transformer_forward(&transformer, &psram, token, pos);
-
-        int next;
-        if (pos < n_prompt - 1) {
-            next = prompt_tokens[pos + 1]; // still feeding the prompt
-        } else {
-            next = sample(logits, p->vocab_size, TEMPERATURE, TOP_P, probindex);
-        }
-
-        tokenizer_decode_piece(&tok, token, next, piece_buf, sizeof(piece_buf), &plen);
-        fwrite(piece_buf, 1, plen, stdout);
+    while (true) {
+        printf("\n> ");
         fflush(stdout);
+        read_line(prompt, sizeof(prompt));
+        if (prompt[0] == '\0') continue;
 
-        token = next;
-        pos++;
-        if (next == 1) break; // BOS re-appearing marks end of sequence, same as upstream run.c
+        int n_prompt = tokenizer_encode(&tok, prompt, prompt_tokens, PROMPT_BUF_SIZE);
+
+        int token = prompt_tokens[0]; // BOS
+        int pos = 0;
+        int plen;
+
+        while (pos < steps) {
+            float* logits = transformer_forward(&transformer, &psram, token, pos);
+
+            int next;
+            if (pos < n_prompt - 1) {
+                next = prompt_tokens[pos + 1]; // still feeding the prompt back in
+            } else {
+                next = sample(logits, p->vocab_size, TEMPERATURE, TOP_P, probindex);
+            }
+
+            int should_stop = (pos + 1 >= n_prompt) && (next == 1); // BOS reappearing = model's own stop signal
+            if (!should_stop) {
+                tokenizer_decode_piece(&tok, token, next, piece_buf, sizeof(piece_buf), &plen);
+                fwrite(piece_buf, 1, plen, stdout);
+                fflush(stdout);
+            }
+
+            token = next;
+            pos++;
+            if (should_stop) break;
+        }
+        printf("\n");
     }
-
-    printf("\n\n=== done ===\n");
-    while (true) tight_loop_contents();
 }

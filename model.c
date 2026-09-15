@@ -10,9 +10,63 @@
 // (write_command[0] = (4 + count) * 8 in psram_spi.h), which overflows past
 // ~27-31 bytes. Larger single calls silently corrupt the PIO transaction and
 // hang dma_channel_wait_for_finish_blocking() forever. Chunk everything.
-#define PSRAM_MAX_CHUNK 16u
+// The PIO SPI program packs the transaction length into a single byte:
+//   write_command[0] = (4 + count) * 8  -> needs 4+count <= 31, so count <= 27
+//   read_command[1]  = count * 8        -> needs count <= 31
+// Exceeding those silently wraps the byte and corrupts the transaction (which
+// then hangs the DMA completion wait forever). Use the largest 4-aligned values
+// that stay inside both limits - bigger chunks mean proportionally fewer SPI
+// transactions, which is the dominant cost of KV-cache traffic.
+#define PSRAM_MAX_WRITE_CHUNK 24u
+#define PSRAM_MAX_READ_CHUNK  28u
+#define PSRAM_MAX_CHUNK       PSRAM_MAX_WRITE_CHUNK
 
-static inline void kv_write(psram_spi_inst_t* spi, uint32_t addr, const float* v, int n) {
+// ---- DIAGNOSTIC MODE ------------------------------------------------------
+// Build with -DKV_CACHE_IN_SRAM to keep the KV cache in SRAM and never touch
+// PSRAM at all. The cache needs n_layers*seq_len*kv_dim*4*2 bytes, so seq_len
+// is clamped to KV_DEBUG_MAX_SEQ to fit in the RP2350's 520KB of SRAM.
+//
+// Purpose: split "PSRAM corrupts data" from "the transformer math is wrong".
+// If output is fluent in this mode but garbage with PSRAM, it's PSRAM.
+#ifdef KV_CACHE_IN_SRAM
+#ifndef KV_DEBUG_MAX_SEQ
+#define KV_DEBUG_MAX_SEQ 24
+#endif
+#endif
+
+// Counters so corruption is reported as a number instead of being invisible.
+static uint32_t kv_read_retries = 0;
+static uint32_t kv_read_failures = 0;
+static uint32_t kv_write_retries = 0;
+
+void kv_stats_print(void) {
+    printf("[KV] write retries=%lu  read retries=%lu  read HARD FAILURES=%lu\n",
+           (unsigned long)kv_write_retries, (unsigned long)kv_read_retries,
+           (unsigned long)kv_read_failures);
+}
+
+// A trailing checksum is stored after each cached vector, so a corrupted read
+// is *detected* rather than guessed at. The previous magnitude-only check could
+// only catch exponent-bit corruption; a mantissa bit flip yields a plausible
+// small float that passed straight through it. This catches any bit flip.
+#ifndef KV_CACHE_IN_SRAM
+static uint32_t kv_checksum(const float* v, int n) {
+    const uint8_t* b = (const uint8_t*)v;
+    uint32_t h = 2166136261u; // FNV-1a
+    for (size_t i = 0; i < (size_t)n * sizeof(float); i++) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    return h ? h : 1u; // never 0, so an all-zero read can't look valid
+}
+#endif
+
+static inline void kv_write(psram_spi_inst_t* spi, RunState* s, uint32_t addr, const float* v, int n) {
+#ifdef KV_CACHE_IN_SRAM
+    (void)spi;
+    memcpy(s->sram_kv + addr, v, (size_t)n * sizeof(float));
+#else
+    (void)s;
     const uint8_t* src = (const uint8_t*)v;
     size_t remaining = (size_t)n * sizeof(float);
     uint32_t a = addr;
@@ -23,44 +77,50 @@ static inline void kv_write(psram_spi_inst_t* spi, uint32_t addr, const float* v
             psram_write(spi, a, src, chunk);
             psram_read(spi, a, verify, chunk);
             if (memcmp(verify, src, chunk) == 0) break;
-#ifdef PSRAM_DEBUG
-            printf("PSRAM write mismatch at addr %lu, attempt %d\n", (unsigned long)a, attempt);
-#endif
+            kv_write_retries++;
         }
         src += chunk; a += chunk; remaining -= chunk;
     }
+    // store the checksum immediately after the vector
+    uint32_t sum = kv_checksum(v, n);
+    uint32_t sum_addr = addr + (uint32_t)((size_t)n * sizeof(float));
+    for (int attempt = 0; attempt < 5; attempt++) {
+        uint32_t back = 0;
+        psram_write(spi, sum_addr, (const uint8_t*)&sum, sizeof(sum));
+        psram_read(spi, sum_addr, (uint8_t*)&back, sizeof(back));
+        if (back == sum) break;
+        kv_write_retries++;
+    }
+#endif
 }
-static inline void kv_read(psram_spi_inst_t* spi, uint32_t addr, float* v, int n) {
+
+static inline void kv_read(psram_spi_inst_t* spi, RunState* s, uint32_t addr, float* v, int n) {
+#ifdef KV_CACHE_IN_SRAM
+    (void)spi;
+    memcpy(v, s->sram_kv + addr, (size_t)n * sizeof(float));
+#else
+    (void)s;
+    uint32_t sum_addr = addr + (uint32_t)((size_t)n * sizeof(float));
     for (int attempt = 0; attempt < 4; attempt++) {
         uint8_t* dst = (uint8_t*)v;
         size_t remaining = (size_t)n * sizeof(float);
         uint32_t a = addr;
         while (remaining > 0) {
-            size_t chunk = remaining < PSRAM_MAX_CHUNK ? remaining : PSRAM_MAX_CHUNK;
+            size_t chunk = remaining < PSRAM_MAX_READ_CHUNK ? remaining : PSRAM_MAX_READ_CHUNK;
             psram_read(spi, a, dst, chunk);
             dst += chunk; a += chunk; remaining -= chunk;
         }
-        // Sanity check: reject NaN/Inf or implausible magnitudes and retry the
-        // read. Real activations in this model stay well under this range;
-        // anything wildly outside it means the SPI transfer glitched.
-        int ok = 1;
-        for (int i = 0; i < n; i++) {
-            float val = v[i];
-            if (!(val == val) || val > 1e4f || val < -1e4f) { ok = 0; break; }
-        }
-        if (ok) return;
-#ifdef PSRAM_DEBUG
-        printf("kv_read: implausible data at addr %lu, retrying (attempt %d)\n", (unsigned long)addr, attempt);
-#endif
+        uint32_t stored = 0;
+        psram_read(spi, sum_addr, (uint8_t*)&stored, sizeof(stored));
+        if (stored == kv_checksum(v, n)) return; // verified good
+        kv_read_retries++;
     }
-    // Every attempt looked bad - zero it out rather than let garbage/NaN
-    // cascade through the rest of generation forever.
+    kv_read_failures++;
     memset(v, 0, (size_t)n * sizeof(float));
+#endif
 }
 
-// One-shot diagnostic: tells us exactly where a NaN/Inf first appears so we
-// know whether the write-verify above actually fixed the root cause, or
-// whether something else is overflowing.
+// One-shot diagnostic: tells us exactly where a NaN/Inf first appears.
 static int nan_already_reported = 0;
 static void check_finite(const char* where, const float* buf, int n, int layer, int pos) {
     if (nan_already_reported) return;
@@ -105,14 +165,44 @@ static void matmul(float* out, const float* x, const float* w, int n, int d) {
 // contiguous elements (v2 quantized format). Dequantizes on the fly and
 // multiplies against the (still fp32) activation vector - simpler and just
 // as correct as int8xint8 dot products, at some cost in raw speed.
+// PERF: the obvious formulation - `sum += q[k] * scale[k / group_size] * x[j]`
+// with a 64-bit k - costs one __aeabi_ldivmod library call per multiply-accumulate
+// on Cortex-M33 (no hardware 64-bit divide), i.e. millions of libcalls per token.
+// Instead we exploit the fact that quantization groups are contiguous over the
+// flattened weight array: when n is a multiple of group_size every row starts on
+// a group boundary, so we can walk group-by-group with plain pointer bumps. No
+// division, no 64-bit math in the hot path, and the scale multiply is hoisted to
+// once per group instead of once per element.
 static void matmul_q8(float* out, const float* x, const int8_t* q, const float* scale,
                        int n, int d, int group_size) {
+    if (group_size > 0 && n % group_size == 0) {
+        int groups_per_row = n / group_size;
+        const int8_t* qrow = q;
+        const float* srow = scale;
+        for (int i = 0; i < d; i++) {
+            float sum = 0.0f;
+            const float* xp = x;
+            for (int g = 0; g < groups_per_row; g++) {
+                float acc = 0.0f;
+                for (int j = 0; j < group_size; j++) acc += (float)qrow[j] * xp[j];
+                sum += acc * srow[g]; // one scale multiply per GROUP, not per element
+                qrow += group_size;
+                xp += group_size;
+            }
+            srow += groups_per_row;
+            out[i] = sum;
+        }
+        return;
+    }
+    // Fallback for the unusual case where rows don't align to group boundaries.
+    // Still avoids division by tracking the group index incrementally.
+    size_t k = 0, in_group = 0, g = 0;
     for (int i = 0; i < d; i++) {
-        int64_t row_start = (int64_t)i * n;
         float sum = 0.0f;
         for (int j = 0; j < n; j++) {
-            int64_t k = row_start + j;
-            sum += (q[k] * scale[k / group_size]) * x[j];
+            sum += ((float)q[k] * scale[g]) * x[j];
+            k++;
+            if (++in_group == (size_t)group_size) { in_group = 0; g++; }
         }
         out[i] = sum;
     }
@@ -132,10 +222,22 @@ static void linear(float* out, const float* x, const float* w_fp32,
 // Dequantizes `n` consecutive elements starting at flat offset `row*n` from a
 // quantized tensor - used for the embedding lookup (one row, not a full matmul).
 static void dequant_row(float* out, const int8_t* q, const float* scale, int64_t row, int n, int group_size) {
-    int64_t base = row * n;
+    size_t base = (size_t)row * (size_t)n;
+    const int8_t* qp = q + base;
+    if (group_size > 0 && n % group_size == 0) {
+        // row starts on a group boundary - walk groups, no division
+        const float* sp = scale + base / (size_t)group_size;
+        int groups = n / group_size;
+        for (int g = 0; g < groups; g++) {
+            float s = sp[g];
+            for (int j = 0; j < group_size; j++) out[g * group_size + j] = (float)qp[g * group_size + j] * s;
+        }
+        return;
+    }
+    size_t g = base / (size_t)group_size, in_group = base % (size_t)group_size;
     for (int j = 0; j < n; j++) {
-        int64_t k = base + j;
-        out[j] = q[k] * scale[k / group_size];
+        out[j] = (float)qp[j] * scale[g];
+        if (++in_group == (size_t)group_size) { in_group = 0; g++; }
     }
 }
 
@@ -255,6 +357,20 @@ void transformer_init(Transformer* t, const uint8_t* blob) {
     }
 
     RunState* s = &t->state;
+
+#ifdef KV_CACHE_IN_SRAM
+    // Clamp AFTER weight-pointer setup (the v0 layout uses seq_len for the
+    // legacy freq_cis placeholders, so clamping earlier would misalign it).
+    if (p->seq_len > KV_DEBUG_MAX_SEQ) {
+        printf("[KV-SRAM DEBUG] clamping seq_len %d -> %d to fit cache in SRAM\n",
+               p->seq_len, KV_DEBUG_MAX_SEQ);
+        p->seq_len = KV_DEBUG_MAX_SEQ;
+    }
+    s->kv_slot_bytes = (uint32_t)((size_t)kv_dim * sizeof(float)); // no checksum needed in SRAM
+#else
+    s->kv_slot_bytes = (uint32_t)((size_t)kv_dim * sizeof(float) + sizeof(uint32_t));
+#endif
+
     s->x      = malloc((size_t)p->dim * sizeof(float));
     s->xb     = malloc((size_t)p->dim * sizeof(float));
     s->xb2    = malloc((size_t)p->dim * sizeof(float));
@@ -266,8 +382,21 @@ void transformer_init(Transformer* t, const uint8_t* blob) {
     s->att    = malloc((size_t)p->n_heads * p->seq_len * sizeof(float));
     s->logits = malloc((size_t)p->vocab_size * sizeof(float));
 
+    size_t one_cache = (size_t)p->n_layers * p->seq_len * s->kv_slot_bytes;
     s->key_cache_base = 0;
-    s->value_cache_base = (uint32_t)((size_t)p->n_layers * p->seq_len * kv_dim * sizeof(float));
+    s->value_cache_base = (uint32_t)one_cache;
+
+#ifdef KV_CACHE_IN_SRAM
+    s->sram_kv = malloc(one_cache * 2);
+    printf("[KV-SRAM DEBUG] KV cache in SRAM: %u bytes %s\n",
+           (unsigned)(one_cache * 2), s->sram_kv ? "OK" : "*** ALLOC FAILED ***");
+    if (!s->sram_kv) {
+        printf("  lower KV_DEBUG_MAX_SEQ and rebuild\n");
+    }
+#else
+    s->sram_kv = NULL;
+    printf("KV cache in PSRAM: %u bytes\n", (unsigned)(one_cache * 2));
+#endif
 }
 
 // ---- forward ------------------------------------------------------------
@@ -330,15 +459,16 @@ float* transformer_forward(Transformer* t, psram_spi_inst_t* psram, int token, i
             }
         }
 
-        uint32_t key_addr   = s->key_cache_base   + ((size_t)(l * p->seq_len + pos) * kv_dim) * sizeof(float);
-        uint32_t value_addr = s->value_cache_base + ((size_t)(l * p->seq_len + pos) * kv_dim) * sizeof(float);
-        kv_write(psram, key_addr, k_local, kv_dim);
-        kv_write(psram, value_addr, v_local, kv_dim);
+        uint32_t slot = s->kv_slot_bytes;
+        uint32_t key_addr   = s->key_cache_base   + (uint32_t)(l * p->seq_len + pos) * slot;
+        uint32_t value_addr = s->value_cache_base + (uint32_t)(l * p->seq_len + pos) * slot;
+        kv_write(psram, s, key_addr, k_local, kv_dim);
+        kv_write(psram, s, value_addr, v_local, kv_dim);
 
         // Pass 1: attention scores for ALL heads, reading each cached position once
         for (int tstep = 0; tstep <= pos; tstep++) {
-            uint32_t kaddr = s->key_cache_base + ((size_t)(l * p->seq_len + tstep) * kv_dim) * sizeof(float);
-            kv_read(psram, kaddr, s->keyt, kv_dim);
+            uint32_t kaddr = s->key_cache_base + (uint32_t)(l * p->seq_len + tstep) * slot;
+            kv_read(psram, s, kaddr, s->keyt, kv_dim);
             for (int hh = 0; hh < p->n_heads; hh++) {
                 int kvh = hh / kv_mul;
                 const float* qh = s->q + hh * head_size;
@@ -354,8 +484,8 @@ float* transformer_forward(Transformer* t, psram_spi_inst_t* psram, int token, i
         memset(s->xb, 0, dim * sizeof(float));
         // Pass 2: weighted sum over values, again reading each cached position once
         for (int tstep = 0; tstep <= pos; tstep++) {
-            uint32_t vaddr = s->value_cache_base + ((size_t)(l * p->seq_len + tstep) * kv_dim) * sizeof(float);
-            kv_read(psram, vaddr, s->valt, kv_dim);
+            uint32_t vaddr = s->value_cache_base + (uint32_t)(l * p->seq_len + tstep) * slot;
+            kv_read(psram, s, vaddr, s->valt, kv_dim);
             for (int hh = 0; hh < p->n_heads; hh++) {
                 int kvh = hh / kv_mul;
                 float a = s->att[hh * p->seq_len + tstep];
